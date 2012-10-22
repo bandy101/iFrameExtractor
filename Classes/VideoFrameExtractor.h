@@ -89,5 +89,7 @@
 /* Seek to closest keyframe near specified time */
 -(void)seekTime:(double)seconds;
 
+-(void)closeAudio;
+
 
 @end

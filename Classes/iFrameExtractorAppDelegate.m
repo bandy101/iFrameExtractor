@@ -78,6 +78,7 @@
 	if (![video stepFrame]) {
 		[timer invalidate];
 		[playButton setEnabled:YES];
+        [video closeAudio];
 		return;
 	}
 	imageView.image = video.currentImage;

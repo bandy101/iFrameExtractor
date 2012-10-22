@@ -346,7 +346,10 @@ initError:
 }
 
 
-
+-(void)closeAudio {
+    [audioController _stopAudio];
+    primed=NO;
+}
 
 
 
