@@ -37,7 +37,7 @@
 }
 
 - (void)applicationDidFinishLaunching:(UIApplication *)application {    
-	self.video = [[VideoFrameExtractor alloc] initWithVideo:[Utilities bundlePath:@"sophie.mov"]];
+	self.video = [[VideoFrameExtractor alloc] initWithVideo:[Utilities bundlePath:@"sophie.mov"] usesTcp:NO];
 	[video release];
 
 	// set output image size

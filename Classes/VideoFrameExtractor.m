@@ -8,6 +8,7 @@
 
 #import "VideoFrameExtractor.h"
 #import "Utilities.h"
+#import "AudioController.h"
 
 @interface VideoFrameExtractor (private)
 -(void)convertFrameToRGB;
@@ -18,7 +19,12 @@
 
 @implementation VideoFrameExtractor
 
+@synthesize audioPacketQueue,audioPacketQueueSize;
+@synthesize _audioStream,_audioCodecContext;
+@synthesize emptyAudioBuffer;
+
 @synthesize outputWidth, outputHeight;
+AudioController *audioController;
 
 -(void)setOutputWidth:(int)newValue {
 	if (outputWidth == newValue) return;
@@ -55,7 +61,7 @@
 	return pCodecCtx->height;
 }
 
--(id)initWithVideo:(NSString *)moviePath {
+-(id)initWithVideo:(NSString *)moviePath usesTcp:(BOOL)usesTcp {
 	if (!(self=[super init])) return nil;
  
     AVCodec         *pCodec;
@@ -63,12 +69,27 @@
     // Register all formats and codecs
     avcodec_register_all();
     av_register_all();
-	
+	/*
     // Open video file
     if(avformat_open_input(&pFormatCtx, [moviePath cStringUsingEncoding:NSASCIIStringEncoding], NULL, NULL) != 0) {
         av_log(NULL, AV_LOG_ERROR, "Couldn't open file\n");
         goto initError;
     }
+    */
+    
+    
+    // Set the RTSP Options
+    AVDictionary *opts = 0;
+    if (usesTcp) 
+        av_dict_set(&opts, "rtsp_transport", "tcp", 0);
+
+    
+if(avformat_open_input(&pFormatCtx, [moviePath UTF8String], NULL, &opts)!=0) {
+        av_log(NULL, AV_LOG_ERROR, "Couldn't open file\n");
+    goto initError;
+}
+    
+
 	
     // Retrieve stream information
     if(avformat_find_stream_info(pFormatCtx,NULL) < 0) {
@@ -76,12 +97,29 @@
         goto initError;
     }
     
+    
     // Find the first video stream
-    if ((videoStream =  av_find_best_stream(pFormatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, &pCodec, 0)) < 0) {
-        av_log(NULL, AV_LOG_ERROR, "Cannot find a video stream in the input file\n");
-        goto initError;
+    videoStream=-1;
+    audioStream=-1;
+    for(int i=0; i<pFormatCtx->nb_streams; i++) {
+        if(pFormatCtx->streams[i]->codec->codec_type==AVMEDIA_TYPE_VIDEO)
+        {
+            videoStream=i;
+        }
+        
+        if(pFormatCtx->streams[i]->codec->codec_type==AVMEDIA_TYPE_AUDIO)
+        {
+            audioStream=i;
+            NSLog(@"found audio stream");
+        }
+        
     }
-	
+    
+    if(videoStream==-1 && audioStream==-1)
+         goto initError;
+
+
+  	
     // Get a pointer to the codec context for the video stream
     pCodecCtx = pFormatCtx->streams[videoStream]->codec;
     
@@ -97,6 +135,12 @@
         av_log(NULL, AV_LOG_ERROR, "Cannot open video decoder\n");
         goto initError;
     }
+    
+    if (audioStream > -1 ) {
+        NSLog(@"set up audiodecoder");
+        [self setupAudioDecoder];
+    }
+
 	
     // Allocate video frame
     pFrame = avcodec_alloc_frame();
@@ -158,6 +202,8 @@ initError:
 	
     // Close the video file
     if (pFormatCtx) avformat_close_input(&pFormatCtx);
+       [audioController release];
+
 	
 	[super dealloc];
 }
@@ -172,6 +218,26 @@ initError:
             // Decode video frame
             avcodec_decode_video2(pCodecCtx, pFrame, &frameFinished, &packet);
         }
+        
+        if(packet.stream_index==audioStream) {
+            // NSLog(@"audio stream");
+            [audioPacketQueueLock lock];
+            audioPacketQueueSize += packet.size;
+            [audioPacketQueue addObject:[NSMutableData dataWithBytes:&packet length:sizeof(packet)]];
+            [audioPacketQueueLock unlock];
+            
+            
+            if (!primed) {
+                primed=YES;
+                [audioController _startAudio];
+            }
+            
+            if (emptyAudioBuffer) {
+                [audioController enqueueBuffer:emptyAudioBuffer];
+            }
+        }
+        
+
 		
 	}
 	return frameFinished!=0;
@@ -207,6 +273,82 @@ initError:
 	
 	return image;
 }
+
+- (void) setupAudioDecoder
+{
+    
+    if (audioStream >= 0) {
+        
+        _audioBufferSize = AVCODEC_MAX_AUDIO_FRAME_SIZE;
+        _audioBuffer = av_malloc(_audioBufferSize);
+        _inBuffer = NO;
+        
+        _audioCodecContext = pFormatCtx->streams[audioStream]->codec;
+        _audioStream = pFormatCtx->streams[audioStream];
+        
+        AVCodec *codec = avcodec_find_decoder(_audioCodecContext->codec_id);
+        if (codec == NULL) {
+            NSLog(@"Not found audio codec.");
+            return;
+        }
+        
+        if (avcodec_open2(_audioCodecContext, codec, NULL) < 0) {
+            NSLog(@"Could not open audio codec.");
+            return;
+        }
+        
+        audioPacketQueue = [[NSMutableArray alloc] init];
+        
+        
+        // audioPacketQueueLock = [[NSLock alloc] init];
+        audioController = [[AudioController alloc]initWithStreamer:self];
+        
+        
+    }
+    else {
+        pFormatCtx->streams[audioStream]->discard = AVDISCARD_ALL;
+        audioStream = -1;
+    }
+    
+}
+
+- (void)nextPacket {
+    _inBuffer = NO;
+}
+
+- (AVPacket*)readPacket {
+    
+    if (_currentPacket.size > 0 || _inBuffer) return &_currentPacket;
+    
+    NSMutableData *packetData = [audioPacketQueue objectAtIndex:0];
+    _packet = [packetData mutableBytes];
+    
+    // NSLog(@"got audio stream");
+    if (_packet->dts != AV_NOPTS_VALUE) {
+        _packet->dts += av_rescale_q(0, AV_TIME_BASE_Q, _audioStream->time_base);
+    }
+    if (_packet->pts != AV_NOPTS_VALUE) {
+        _packet->pts += av_rescale_q(0, AV_TIME_BASE_Q, _audioStream->time_base);
+    }
+    // NSLog(@"ready with audio");
+    
+    
+    [audioPacketQueueLock lock];
+    audioPacketQueueSize -= _packet->size;
+    [audioPacketQueue removeObjectAtIndex:0];
+    [audioPacketQueueLock unlock];
+    
+    
+    
+    _currentPacket = *(_packet);
+    
+    return &_currentPacket;   
+}
+
+
+
+
+
 
 -(void)savePPMPicture:(AVPicture)pict width:(int)width height:(int)height index:(int)iFrame {
     FILE *pFile;
